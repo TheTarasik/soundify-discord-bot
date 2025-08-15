@@ -33,6 +33,81 @@ client.once("ready", () => {
   console.log(`✅ Бот увімкнений як ${client.user.tag}`);
 });
 
+function createControlButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("prev")
+      .setLabel("⏮️ Prev")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("stop")
+      .setLabel("⏹️ Stop")
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId("next")
+      .setLabel("⏭️ Next")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("replay")
+      .setLabel("🔁 Replay")
+      .setStyle(ButtonStyle.Primary)
+  );
+}
+
+async function playTrack(guildId, trackIndex = null) {
+  const data = guildData.get(guildId);
+  if (!data || data.queue.length === 0) return false;
+
+  if (trackIndex !== null) {
+    data.currentTrackIndex = trackIndex;
+  }
+
+  const currentTrack = data.queue[data.currentTrackIndex];
+  if (!currentTrack) return false;
+
+  try {
+    const stream = new PassThrough();
+    get(currentTrack, (res) => {
+      res.pipe(stream);
+    });
+
+    const resource = createAudioResource(stream);
+    data.player.play(resource);
+    data.connection.subscribe(data.player);
+
+    return true;
+  } catch (error) {
+    console.error("Помилка відтворення:", error);
+    return false;
+  }
+}
+
+async function updateQueueMessage(message, guildId) {
+  const data = guildData.get(guildId);
+  if (!data) return;
+
+  const queueInfo = data.queue
+    .map((track, index) => {
+      const trackNum = index + 1;
+      const isCurrentTrack = index === data.currentTrackIndex;
+      return `${isCurrentTrack ? "▶️" : "📀"} ${trackNum}. Трек ${trackNum}`;
+    })
+    .join("\n");
+
+  const content = `🎶 **Черга треків** (${data.currentTrackIndex + 1}/${
+    data.queue.length
+  })\n\n${queueInfo}`;
+
+  try {
+    await message.edit({
+      content,
+      components: [createControlButtons()],
+    });
+  } catch (error) {
+    console.error("Помилка оновлення повідомлення:", error);
+  }
+}
+
 client.on("messageCreate", async (message) => {
   if (!message.content.startsWith("!play") || message.author.bot) return;
 
@@ -43,7 +118,7 @@ client.on("messageCreate", async (message) => {
     !mp3Url ||
     !mp3Url.startsWith("https://files.soundify.one/static/media/")
   ) {
-    message.reply("❌ Введи пряме посилання");
+    message.reply("❌ Введи пряме посилання на трек");
     return;
   }
 
@@ -53,55 +128,79 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  try {
-    const connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: message.guild.id,
-      adapterCreator: message.guild.voiceAdapterCreator,
-    });
+  let data = guildData.get(message.guild.id);
 
-    const player = createAudioPlayer();
+  if (!data || !data.connection) {
+    try {
+      const connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: message.guild.id,
+        adapterCreator: message.guild.voiceAdapterCreator,
+      });
 
-    const stream = new PassThrough();
-    get(mp3Url, (res) => {
-      res.pipe(stream);
-    });
+      const player = createAudioPlayer();
 
-    const resource = createAudioResource(stream);
+      data = {
+        connection,
+        player,
+        queue: [mp3Url],
+        currentTrackIndex: 0,
+        controlMessage: null,
+      };
 
-    guildData.set(message.guild.id, {
-      connection,
-      player,
-      resource,
-      mp3Url,
-    });
+      guildData.set(message.guild.id, data);
 
-    connection.subscribe(player);
-    player.play(resource);
+      player.on(AudioPlayerStatus.Idle, async () => {
+        const currentData = guildData.get(message.guild.id);
+        if (!currentData) return;
 
-    player.on(AudioPlayerStatus.Idle, () => {
-      connection.destroy();
-      guildData.delete(message.guild.id);
-    });
+        if (currentData.currentTrackIndex < currentData.queue.length - 1) {
+          currentData.currentTrackIndex++;
+          const success = await playTrack(message.guild.id);
 
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("stop")
-        .setLabel("⏹️ Stop")
-        .setStyle(ButtonStyle.Danger),
-      new ButtonBuilder()
-        .setCustomId("replay")
-        .setLabel("▶️ Replay")
-        .setStyle(ButtonStyle.Primary)
-    );
+          if (success && currentData.controlMessage) {
+            await updateQueueMessage(
+              currentData.controlMessage,
+              message.guild.id
+            );
+          }
+        } else {
+          connection.destroy();
+          guildData.delete(message.guild.id);
 
-    await message.reply({
-      content: "🎶 Відтворення...",
-      components: [row],
-    });
-  } catch (err) {
-    console.error(err);
-    message.reply("🚫 Помилка під час програвання треку");
+          if (currentData.controlMessage) {
+            try {
+              await currentData.controlMessage.edit({
+                content: "✅ Черга треків завершена!",
+                components: [],
+              });
+            } catch (error) {
+              console.error("Помилка оновлення повідомлення:", error);
+            }
+          }
+        }
+      });
+
+      await playTrack(message.guild.id);
+
+      const controlMessage = await message.reply({
+        content: `🎶 **Черга треків** (1/1)\n\n▶️ 1. Трек 1`,
+        components: [createControlButtons()],
+      });
+
+      data.controlMessage = controlMessage;
+    } catch (err) {
+      console.error(err);
+      message.reply("🚫 Помилка під час підключення до голосового каналу");
+    }
+  } else {
+    data.queue.push(mp3Url);
+
+    if (data.controlMessage) {
+      await updateQueueMessage(data.controlMessage, message.guild.id);
+    }
+
+    message.reply(`✅ Трек додано до черги! Позиція: ${data.queue.length}`);
   }
 });
 
@@ -111,88 +210,97 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const guildId = interaction.guildId;
   const data = guildData.get(guildId);
 
-  if (!data) {
+  if (!data || !data.connection) {
     await interaction.reply({
-      content: "⛔ Трек не відтворюється",
+      content: "⛔ Бот не активний або черга порожня",
       ephemeral: true,
     });
     return;
   }
 
-  const { connection, player, mp3Url } = data;
+  switch (interaction.customId) {
+    case "stop":
+      data.player.stop();
+      data.connection.destroy();
+      guildData.delete(guildId);
 
-  if (interaction.customId === "stop") {
-    player.stop();
-    connection.destroy();
+      await interaction.update({
+        content: "🛑 Відтворення зупинено і черга очищена",
+        components: [],
+      });
+      break;
 
-    guildData.set(guildId, {
-      ...data,
-      connection: null,
-      player: null,
-      resource: null,
-      isStopped: true,
-    });
+    case "next":
+      if (data.currentTrackIndex < data.queue.length - 1) {
+        data.currentTrackIndex++;
+        const success = await playTrack(guildId);
 
-    await interaction.reply({
-      content:
-        "🛑 Відтворення зупинено. Натисни ▶️ Replay, щоб знову увімкнути.",
-      ephemeral: true,
-    });
-  }
-
-  if (interaction.customId === "replay") {
-    let { connection, player, isStopped } = data;
-
-    if (isStopped || !connection || !player) {
-      const voiceChannel = interaction.member.voice.channel;
-      if (!voiceChannel) {
+        if (success) {
+          await updateQueueMessage(interaction.message, guildId);
+          await interaction.reply({
+            content: `⏭️ Перехід до наступного треку (${
+              data.currentTrackIndex + 1
+            }/${data.queue.length})`,
+            ephemeral: true,
+          });
+        } else {
+          await interaction.reply({
+            content: "❌ Помилка переходу до наступного треку",
+            ephemeral: true,
+          });
+        }
+      } else {
         await interaction.reply({
-          content: "🔊 Зайди в голосовий канал, щоб повторно увімкнути трек.",
+          content: "⏭️ Це останній трек у черзі",
           ephemeral: true,
         });
-        return;
       }
+      break;
 
-      connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: guildId,
-        adapterCreator: interaction.guild.voiceAdapterCreator,
-      });
+    case "prev":
+      if (data.currentTrackIndex > 0) {
+        data.currentTrackIndex--;
+        const success = await playTrack(guildId);
 
-      player = createAudioPlayer();
+        if (success) {
+          await updateQueueMessage(interaction.message, guildId);
+          await interaction.reply({
+            content: `⏮️ Перехід до попереднього треку (${
+              data.currentTrackIndex + 1
+            }/${data.queue.length})`,
+            ephemeral: true,
+          });
+        } else {
+          await interaction.reply({
+            content: "❌ Помилка переходу до попереднього треку",
+            ephemeral: true,
+          });
+        }
+      } else {
+        await interaction.reply({
+          content: "⏮️ Це перший трек у черзі",
+          ephemeral: true,
+        });
+      }
+      break;
 
-      guildData.set(guildId, {
-        ...data,
-        connection,
-        player,
-        isStopped: false,
-      });
-    }
+    case "replay":
+      const success = await playTrack(guildId);
 
-    const stream = new PassThrough();
-    get(mp3Url, (res) => {
-      res.pipe(stream);
-    });
-
-    const resource = createAudioResource(stream);
-    player.play(resource);
-    connection.subscribe(player);
-
-    player.on(AudioPlayerStatus.Idle, () => {
-      connection.destroy();
-      guildData.set(guildId, {
-        ...guildData.get(guildId),
-        connection: null,
-        player: null,
-        resource: null,
-        isStopped: true,
-      });
-    });
-
-    await interaction.reply({
-      content: "🔁 Відтворення з початку",
-      ephemeral: true,
-    });
+      if (success) {
+        await interaction.reply({
+          content: `🔁 Повтор поточного треку (${data.currentTrackIndex + 1}/${
+            data.queue.length
+          })`,
+          ephemeral: true,
+        });
+      } else {
+        await interaction.reply({
+          content: "❌ Помилка повтору треку",
+          ephemeral: true,
+        });
+      }
+      break;
   }
 });
 
